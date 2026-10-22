@@ -23,6 +23,10 @@
 /* XDS110 stand-alone probe hardware ID */
 #define XDS110_STAND_ALONE_ID 0x21
 
+/* XDS110 user GPIO pins: GPIO 0-1 may be outputs, GPIO 2-3 are inputs only */
+#define XDS110_GPIO_ALL     0xf
+#define XDS110_GPIO_OUTPUTS 0x3
+
 /* Firmware version that introduced OpenOCD support via block accesses */
 #define OCD_FIRMWARE_VERSION 0x02030011
 #define OCD_FIRMWARE_UPGRADE \
@@ -160,12 +164,18 @@
 #define CMAPI_REG_WRITE  0x16 /* CMAPI DAP register write */
 #define SWD_CONNECT      0x17 /* Switch from JTAG to SWD connection */
 #define SWD_DISCONNECT   0x18 /* Switch from SWD to JTAG connection */
+#define XDS_GPIO_READ    0x29 /* Read a user GPIO register */
+#define XDS_GPIO_WRITE   0x2a /* Write a user GPIO register under a mask */
 #define CJTAG_CONNECT    0x2b /* Switch from JTAG to cJTAG connection */
 #define CJTAG_DISCONNECT 0x2c /* Switch from cJTAG to JTAG connection */
 #define XDS_SET_SUPPLY   0x32 /* Set up stand-alone probe upply voltage */
 #define OCD_DAP_REQUEST  0x3a /* Handle block of DAP requests */
 #define OCD_SCAN_REQUEST 0x3b /* Handle block of JTAG scan requests */
 #define OCD_PATHMOVE     0x3c /* Handle PATHMOVE to navigate JTAG states */
+
+/* Register selectors for XDS_GPIO_READ and XDS_GPIO_WRITE */
+#define XDS_GPIO_REG_LEVEL     0x80000000 /* Pin levels; output levels on write */
+#define XDS_GPIO_REG_DIRECTION 0x80000001 /* 1 = output, 0 = input (hi-Z) */
 
 #define CMD_IR_SCAN      1
 #define CMD_DR_SCAN      2
@@ -227,6 +237,11 @@ struct xds110_info {
 	uint32_t delay_count;
 	/* XDS110 voltage supply setting */
 	uint32_t voltage;
+	/* User GPIO state requested before init, applied on connect */
+	uint8_t gpio_direction;
+	uint8_t gpio_direction_mask;
+	uint8_t gpio_level;
+	uint8_t gpio_level_mask;
 	/* XDS110 firmware and hardware version */
 	uint32_t firmware;
 	uint16_t hardware;
@@ -943,6 +958,42 @@ static bool xds_set_supply(uint32_t voltage)
 				DEFAULT_TIMEOUT);
 }
 
+static bool xds_gpio_read(uint32_t reg, uint16_t *value)
+{
+	uint8_t *reg_pntr = &xds110.write_payload[XDS_OUT_LEN + 0]; /* 32-bits */
+	uint8_t *value_pntr = &xds110.read_payload[XDS_IN_LEN + 0]; /* 16-bits */
+
+	bool success;
+
+	xds110.write_payload[0] = XDS_GPIO_READ;
+
+	xds110_set_u32(reg_pntr, reg);
+
+	success = xds_execute(XDS_OUT_LEN + 4, XDS_IN_LEN + 2, DEFAULT_ATTEMPTS,
+				DEFAULT_TIMEOUT);
+
+	if (success)
+		*value = xds110_get_u16(value_pntr);
+
+	return success;
+}
+
+static bool xds_gpio_write(uint32_t reg, uint8_t value, uint8_t mask)
+{
+	uint8_t *reg_pntr = &xds110.write_payload[XDS_OUT_LEN + 0]; /* 32-bits */
+	uint8_t *value_pntr = &xds110.write_payload[XDS_OUT_LEN + 4]; /* 8-bits */
+	uint8_t *mask_pntr = &xds110.write_payload[XDS_OUT_LEN + 5]; /* 8-bits */
+
+	xds110.write_payload[0] = XDS_GPIO_WRITE;
+
+	xds110_set_u32(reg_pntr, reg);
+	*value_pntr = value;
+	*mask_pntr = mask;
+
+	return xds_execute(XDS_OUT_LEN + 6, XDS_IN_LEN, DEFAULT_ATTEMPTS,
+				DEFAULT_TIMEOUT);
+}
+
 static bool ocd_dap_request(uint8_t *dap_requests, uint32_t request_size,
 	uint32_t *dap_results, uint32_t result_count)
 {
@@ -1383,6 +1434,18 @@ static int xds110_init(void)
 			xds110.hardware = hardware;
 		}
 	}
+
+	/*
+	 * Apply GPIO state requested in the config before anything that needs
+	 * the target, so boot mode pins are set even if the target is off.
+	 * The firmware ignores levels written to inputs, so set direction first.
+	 */
+	if (success && xds110.gpio_direction_mask)
+		success = xds_gpio_write(XDS_GPIO_REG_DIRECTION,
+			xds110.gpio_direction, xds110.gpio_direction_mask);
+	if (success && xds110.gpio_level_mask)
+		success = xds_gpio_write(XDS_GPIO_REG_LEVEL, xds110.gpio_level,
+			xds110.gpio_level_mask);
 
 	if (success) {
 		/* Set supply voltage for stand-alone probes */
@@ -1960,7 +2023,166 @@ COMMAND_HANDLER(xds110_handle_supply_voltage_command)
 	return ERROR_OK;
 }
 
+/* Parse the optional pin mask that follows a GPIO command's value */
+static int xds110_parse_gpio_mask(struct command_invocation *cmd,
+	unsigned int index, uint8_t *mask)
+{
+	*mask = XDS110_GPIO_ALL;
+
+	if (index < CMD_ARGC) {
+		COMMAND_PARSE_NUMBER(u8, CMD_ARGV[index], *mask);
+		if (*mask & ~XDS110_GPIO_ALL) {
+			command_print(CMD, "XDS110: GPIO mask must be within 0x%x",
+				XDS110_GPIO_ALL);
+			return ERROR_COMMAND_ARGUMENT_INVALID;
+		}
+	}
+
+	return ERROR_OK;
+}
+
+COMMAND_HANDLER(xds110_handle_gpio_read_command)
+{
+	uint16_t level;
+	uint8_t mask;
+
+	if (CMD_ARGC > 1)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+
+	int retval = xds110_parse_gpio_mask(CMD, 0, &mask);
+	if (retval != ERROR_OK)
+		return retval;
+
+	if (!xds110.is_connected) {
+		command_print(CMD, "XDS110: GPIO pins can only be read after init");
+		return ERROR_FAIL;
+	}
+
+	if (!xds_gpio_read(XDS_GPIO_REG_LEVEL, &level))
+		return ERROR_FAIL;
+
+	command_print(CMD, "0x%x", level & mask);
+
+	return ERROR_OK;
+}
+
+COMMAND_HANDLER(xds110_handle_gpio_config_command)
+{
+	uint8_t direction;
+	uint8_t mask;
+
+	if (CMD_ARGC < 1 || CMD_ARGC > 2)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+
+	COMMAND_PARSE_NUMBER(u8, CMD_ARGV[0], direction);
+	int retval = xds110_parse_gpio_mask(CMD, 1, &mask);
+	if (retval != ERROR_OK)
+		return retval;
+
+	/* The firmware silently keeps GPIO 2-3 as inputs; reject instead */
+	if (direction & mask & ~XDS110_GPIO_OUTPUTS) {
+		command_print(CMD, "XDS110: only GPIO pins in 0x%x can be outputs",
+			XDS110_GPIO_OUTPUTS);
+		return ERROR_COMMAND_ARGUMENT_INVALID;
+	}
+
+	if (!xds110.is_connected) {
+		/* Merge with earlier requests, init applies them on connect */
+		xds110.gpio_direction = (xds110.gpio_direction & ~mask) |
+			(direction & mask);
+		xds110.gpio_direction_mask |= mask;
+		return ERROR_OK;
+	}
+
+	if (!xds_gpio_write(XDS_GPIO_REG_DIRECTION, direction, mask))
+		return ERROR_FAIL;
+
+	return ERROR_OK;
+}
+
+COMMAND_HANDLER(xds110_handle_gpio_write_command)
+{
+	uint8_t level;
+	uint8_t mask;
+
+	if (CMD_ARGC < 1 || CMD_ARGC > 2)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+
+	COMMAND_PARSE_NUMBER(u8, CMD_ARGV[0], level);
+	int retval = xds110_parse_gpio_mask(CMD, 1, &mask);
+	if (retval != ERROR_OK)
+		return retval;
+
+	if (!xds110.is_connected) {
+		/* Merge with earlier requests, init applies them on connect */
+		xds110.gpio_level = (xds110.gpio_level & ~mask) | (level & mask);
+		xds110.gpio_level_mask |= mask;
+		return ERROR_OK;
+	}
+
+	if (!xds_gpio_write(XDS_GPIO_REG_LEVEL, level, mask))
+		return ERROR_FAIL;
+
+	return ERROR_OK;
+}
+
+COMMAND_HANDLER(xds110_handle_gpio_command)
+{
+	uint16_t direction;
+	uint16_t level;
+
+	if (CMD_ARGC != 0)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+
+	if (!xds110.is_connected) {
+		command_print(CMD, "XDS110: GPIO pins can only be read after init");
+		return ERROR_FAIL;
+	}
+
+	if (!xds_gpio_read(XDS_GPIO_REG_DIRECTION, &direction) ||
+		!xds_gpio_read(XDS_GPIO_REG_LEVEL, &level))
+		return ERROR_FAIL;
+
+	command_print(CMD, "XDS110: GPIO direction = 0x%x, levels = 0x%x",
+		direction & XDS110_GPIO_ALL, level & XDS110_GPIO_ALL);
+
+	return ERROR_OK;
+}
+
+static const struct command_registration xds110_gpio_subcommand_handlers[] = {
+	{
+		.name = "read",
+		.handler = &xds110_handle_gpio_read_command,
+		.mode = COMMAND_EXEC,
+		.help = "return the level of the XDS110 GPIO pins",
+		.usage = "[mask]",
+	},
+	{
+		.name = "config",
+		.handler = &xds110_handle_gpio_config_command,
+		.mode = COMMAND_ANY,
+		.help = "set the XDS110 GPIO pins as outputs (1) or inputs (0)",
+		.usage = "direction [mask]",
+	},
+	{
+		.name = "write",
+		.handler = &xds110_handle_gpio_write_command,
+		.mode = COMMAND_ANY,
+		.help = "set the level of the XDS110 GPIO output pins",
+		.usage = "level [mask]",
+	},
+	COMMAND_REGISTRATION_DONE
+};
+
 static const struct command_registration xds110_subcommand_handlers[] = {
+	{
+		.name = "gpio",
+		.handler = &xds110_handle_gpio_command,
+		.mode = COMMAND_ANY,
+		.help = "show or change the XDS110 GPIO pins",
+		.usage = "",
+		.chain = xds110_gpio_subcommand_handlers,
+	},
 	{
 		.name = "info",
 		.handler = &xds110_handle_info_command,

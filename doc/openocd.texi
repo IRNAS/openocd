@@ -3440,6 +3440,46 @@ can be set to any value in the range 1800 to 3600 millivolts.
 Displays information about the connected XDS110 debug probe (e.g. firmware
 version).
 @end deffn
+
+The stand-alone XDS110 has four user GPIO pins, on both the CTI-20 and the AUX
+connector. GPIO 0 and 1 can drive the target, for example its boot mode
+inputs; GPIO 2 and 3 are inputs only. The pins are bits 0 to 3 of the values
+below, and an optional @var{mask} limits a command to the pins whose bits are
+set. All pins start as inputs (hi-Z). The probe keeps the pin state after
+OpenOCD exits.
+
+@deffn {Command} {xds110 gpio}
+Displays the direction and the levels of the GPIO pins.
+@end deffn
+
+@deffn {Command} {xds110 gpio read} [mask]
+Returns the levels of the GPIO pins, so scripts can test them.
+@end deffn
+
+@deffn {Command} {xds110 gpio config} direction [mask]
+Configures each GPIO pin as an output (1) or an input (0). Only GPIO 0 and 1
+can be outputs. Used before @command{init}, the request is applied as soon as
+OpenOCD connects to the probe, before it needs the target, so the pins are set
+even if @command{init} later fails, e.g. because the target is off.
+@end deffn
+
+@deffn {Command} {xds110 gpio write} level [mask]
+Sets the level of the GPIO output pins. The probe ignores levels written to
+inputs, so configure a pin as an output first; it drives high until written.
+Like @command{xds110 gpio config}, it can be used before @command{init}.
+
+@example
+# Hold GPIO 0 low and GPIO 1 high from the moment OpenOCD connects
+xds110 gpio config 0x3
+xds110 gpio write 0x2
+@end example
+@end deffn
+
+The @file{interface/xds110.cfg} file also defines
+@command{xds110_gpio_pulse} @var{pin} @var{level} @var{ms}, which drives an
+output pin to @var{level} for @var{ms} milliseconds and then to the opposite
+level, and @command{xds110_gpio_wait} @var{pin} @var{level} @var{timeout_ms},
+which waits for a pin to read @var{level}.
 @end deffn
 
 @deffn {Interface Driver} {xlnx_pcie_xvc}
